@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  rviz:
+    build: .
+    image: ros:noetic-with-rviz
+    container_name: rviz_ros1_auto
+    network_mode: host
+    environment:
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - /home/hflabs/bot/drones/bags:/bags
+      - /home/hflabs/bot/drones/src:/src
+    command: >
+      bash -c "
+      source /opt/ros/noetic/setup.bash &&
+      roscore &
+      sleep 5 &&
+      rosbag play /bags/scan-2-all.bag &
+      python3 /src/2d_lidar_localization.py &
+      rviz
+      "
