@@ -25,16 +25,18 @@ class LidarProcessor:
         # Паблишеры
         self.gt_map_pub = rospy.Publisher("/gt_map", MarkerArray, queue_size=1, latch=True)
         self.marker_pub = rospy.Publisher("/map_markers", MarkerArray, queue_size=1)
-        self.calibration_scan_pub = rospy.Publisher("/calibration_scan", Marker, queue_size=1)
 
         # Подписка на данные лидара
         rospy.Subscriber("/scan", LaserScan, self.scan_callback)
 
         # Публикация GT карты один раз при инициализации
+        self.center_x = sum(c[0] for c in map_corners) / 4
+        self.center_y = sum(c[1] for c in map_corners) / 4
+        self.shifted_map_corners = [(x - self.center_x, y - self.center_y) for x, y in map_corners]
         self.publish_gt_map()
 
     def publish_gt_map(self):
-        """Публикует статичную GT карту в отдельном топике /gt_map"""
+        """Публикует статичную GT карту в топике /gt_map с центром в (0, 0)"""
         ma = MarkerArray()
         gt_marker = Marker()
         gt_marker.header.frame_id = "map"
@@ -45,8 +47,8 @@ class LidarProcessor:
         gt_marker.color.g = 1.0
         gt_marker.color.a = 1.0
         for i in range(4):
-            p1 = Point(self.map_corners[i][0], self.map_corners[i][1], 0)
-            p2 = Point(self.map_corners[(i + 1) % 4][0], self.map_corners[(i + 1) % 4][1], 0)
+            p1 = Point(self.shifted_map_corners[i][0], self.shifted_map_corners[i][1], 0)
+            p2 = Point(self.shifted_map_corners[(i + 1) % 4][0], self.shifted_map_corners[(i + 1) % 4][1], 0)
             gt_marker.points.append(p1)
             gt_marker.points.append(p2)
         ma.markers.append(gt_marker)
@@ -66,22 +68,6 @@ class LidarProcessor:
             return
 
         points = self.preprocessor.preprocess_points(points, distance_threshold=0.5)
-
-        # Публикация калибровочного скана в GT системе координат
-        calibration_marker = Marker()
-        calibration_marker.header.frame_id = "map"
-        calibration_marker.header.stamp = msg.header.stamp
-        calibration_marker.ns = "calibration_scan"
-        calibration_marker.id = 0
-        calibration_marker.type = Marker.POINTS
-        calibration_marker.action = Marker.ADD
-        calibration_marker.scale.x = 0.05
-        calibration_marker.scale.y = 0.05
-        calibration_marker.color.r = 1.0
-        calibration_marker.color.a = 1.0
-        calibration_marker.points = [Point(x, y, 0) for x, y in points]
-        self.calibration_scan_pub.publish(calibration_marker)
-
         # Обнаружение линий
         lines = self.line_detector.detect_lines(points)
         if len(lines) < 4:
@@ -100,8 +86,69 @@ class LidarProcessor:
         # Определение положения робота
         robot_position = self.calculate_robot_position(matched_corners)
 
-        # Публикация маркеров (углы и положение робота)
-        self.publish_markers(matched_corners, robot_position, msg.header)
+        # Публикация калибровочного скана в GT системе координат
+        self.publish_markers(points, lines, detected_corners, msg.header)
+
+    def rho_theta_to_points(self, rho, theta, length=10):
+        """Преобразует параметры прямой в две точки для отрисовки"""
+        x0 = rho * math.cos(theta)
+        y0 = rho * math.sin(theta)
+        dx = -math.sin(theta) * length / 2
+        dy = math.cos(theta) * length / 2
+        p1 = (x0 + dx, y0 + dy)
+        p2 = (x0 - dx, y0 - dy)
+        return p1, p2
+
+    def publish_markers(self, points, lines, detected_corners, header):
+        marker_array = MarkerArray()
+
+        # Публикация исходного скана
+        calibration_marker = Marker()
+        calibration_marker.header.frame_id = "map"
+        calibration_marker.ns = "calibration_scan"
+        calibration_marker.id = 0
+        calibration_marker.type = Marker.POINTS
+        calibration_marker.action = Marker.ADD
+        calibration_marker.scale.x = 0.05
+        calibration_marker.scale.y = 0.05
+        calibration_marker.color.r = 1.0
+        calibration_marker.color.a = 1.0
+        calibration_marker.points = [Point(x, y, 0) for x, y in points]
+        marker_array.markers.append(calibration_marker)
+
+        # Публикация линий
+        line_marker = Marker()
+        line_marker.header.frame_id = "map"
+        line_marker.ns = "calibration_lines"
+        line_marker.id = 1
+        line_marker.type = Marker.LINE_LIST
+        line_marker.action = Marker.ADD
+        line_marker.scale.x = 0.03
+        line_marker.color.g = 1.0
+        line_marker.color.a = 1.0
+        for rho, theta in lines:
+            p1, p2 = self.rho_theta_to_points(rho, theta)
+            line_marker.points.append(Point(p1[0], p1[1], 0))
+            line_marker.points.append(Point(p2[0], p2[1], 0))
+        marker_array.markers.append(line_marker)
+
+        # Публикация углов
+        corner_marker = Marker()
+        corner_marker.header.frame_id = "map"
+        corner_marker.ns = "calibration_corners"
+        corner_marker.id = 2
+        corner_marker.type = Marker.SPHERE_LIST
+        corner_marker.action = Marker.ADD
+        corner_marker.scale.x = 0.08
+        corner_marker.scale.y = 0.08
+        corner_marker.scale.z = 0.08
+        corner_marker.color.b = 1.0
+        corner_marker.color.a = 1.0
+        corner_marker.points = [Point(x, y, 0) for x, y in detected_corners]
+        marker_array.markers.append(corner_marker)
+
+        # Публикация всего массива
+        self.marker_pub.publish(marker_array)
 
     def find_corners(self, lines):
         """Находит углы как пересечения линий"""
@@ -158,44 +205,10 @@ class LidarProcessor:
         rospy.logwarn(f"robot_x, robot_y = {robot_x, robot_y}")
         return robot_x, robot_y, robot_z
 
-    def publish_markers(self, corners, robot_position, header):
-        """Публикует статичные углы и динамическое положение робота"""
-        ma = MarkerArray()
-        mid = 0
-
-        # Публикация "натянутых" углов (статичны, так как соответствуют GT)
-        mk_points = Marker()
-        mk_points.header = Header(frame_id="map", stamp=header.stamp)
-        mk_points.id = mid
-        mk_points.type = Marker.POINTS
-        mk_points.scale.x = 0.1
-        mk_points.scale.y = 0.1
-        mk_points.color.r = 1.0
-        mk_points.color.b = 1.0
-        mk_points.color.a = 1.0
-        mk_points.points = [Point(x, y, 0) for x, y in corners]
-        ma.markers.append(mk_points)
-        mid += 1
-
-        # Публикация положения робота (динамично)
-        robot_marker = Marker()
-        robot_marker.header = Header(frame_id="map", stamp=header.stamp)
-        robot_marker.id = mid
-        robot_marker.type = Marker.SPHERE
-        robot_marker.scale.x = 0.2
-        robot_marker.scale.y = 0.2
-        robot_marker.scale.z = 0.2
-        robot_marker.color.r = 1.0
-        robot_marker.color.a = 1.0
-        robot_marker.pose.position = Point(robot_position[0], robot_position[1], 0)
-        ma.markers.append(robot_marker)
-
-        self.marker_pub.publish(ma)
-
 
 if __name__ == "__main__":
     rospy.init_node("lidar_processor")
-    # 14/7
+    # обход карты делаем по часовой стрелке из (0, 0)
     map_corners = [(0, 0), (7, 0), (7, 14), (0, 14)]  # Пример: комната 14x7 метра
     method = "hough"  # или "ransac"
     processor = LidarProcessor(map_corners, method=method)
