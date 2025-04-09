@@ -5,109 +5,15 @@ from sensor_msgs.msg import LaserScan
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
 from std_msgs.msg import Header
-
-
-# Базовый класс для детекторов линий
-class LineDetector:
-    def detect_lines(self, points):
-        raise NotImplementedError("Этот метод должен быть реализован в подклассах")
-
-
-# Детектор линий с использованием преобразования Хаффа
-class HoughLineDetector(LineDetector):
-    def __init__(self, theta_step=math.pi / 180, theta_bins=180, rho_resolution=0.05):
-        self.theta_step = theta_step
-        self.theta_bins = theta_bins
-        self.rho_resolution = rho_resolution
-
-    def detect_lines(self, points):
-        max_rho = np.max(np.hypot(points[:, 0], points[:, 1]))
-        rho_bins = int(2 * max_rho / self.rho_resolution) + 1
-        accumulator = np.zeros((rho_bins, self.theta_bins))
-
-        for x, y in points:
-            for theta_idx in range(self.theta_bins):
-                theta = theta_idx * self.theta_step
-                rho = x * math.cos(theta) + y * math.sin(theta)
-                rho_idx = int((rho + max_rho) / self.rho_resolution)
-                if 0 <= rho_idx < rho_bins:
-                    accumulator[rho_idx, theta_idx] += 1
-
-        sum_over_rho = np.sum(accumulator, axis=0)
-        total_sums = []
-        for theta_idx in range(self.theta_bins):
-            theta_idx2 = (theta_idx + 90) % self.theta_bins
-            total_sum = sum_over_rho[theta_idx] + sum_over_rho[theta_idx2]
-            total_sums.append(total_sum)
-        theta_idx_max = np.argmax(total_sums)
-        theta1_idx = theta_idx_max
-        theta2_idx = (theta_idx_max + 90) % self.theta_bins
-
-        rho_indices1 = np.argsort(accumulator[:, theta1_idx])[-2:][::-1]
-        rho_values1 = [-max_rho + rho_idx * self.rho_resolution for rho_idx in rho_indices1]
-        rho_indices2 = np.argsort(accumulator[:, theta2_idx])[-2:][::-1]
-        rho_values2 = [-max_rho + rho_idx * self.rho_resolution for rho_idx in rho_indices2]
-
-        lines = [
-            (rho_values1[0], theta1_idx * self.theta_step),
-            (rho_values1[1], theta1_idx * self.theta_step),
-            (rho_values2[0], theta2_idx * self.theta_step),
-            (rho_values2[1], theta2_idx * self.theta_step),
-        ]
-        return lines
-
-
-# Детектор линий с использованием RANSAC
-class RansacLineDetector(LineDetector):
-    def __init__(self, num_iterations=100, threshold=0.1, min_inliers=50):
-        self.num_iterations = num_iterations
-        self.threshold = threshold
-        self.min_inliers = min_inliers
-
-    def detect_lines(self, points, num_lines=4):
-        lines = []
-        remaining_points = points.copy()
-        for _ in range(num_lines):
-            best_line = None
-            best_inliers = []
-            for _ in range(self.num_iterations):
-                idx1, idx2 = np.random.choice(len(remaining_points), 2, replace=False)
-                p1, p2 = remaining_points[idx1], remaining_points[idx2]
-                line = self.points_to_line(p1, p2)
-                inliers = self.get_inliers(line, remaining_points)
-                if len(inliers) > len(best_inliers):
-                    best_inliers = inliers
-                    best_line = line
-            if len(best_inliers) >= self.min_inliers:
-                lines.append(best_line)
-                remaining_points = np.delete(remaining_points, best_inliers, axis=0)
-            else:
-                break
-        return lines
-
-    def points_to_line(self, p1, p2):
-        x1, y1 = p1
-        x2, y2 = p2
-        dx = x2 - x1
-        dy = y2 - y1
-        theta = math.atan2(dy, dx)
-        rho = x1 * math.cos(theta) + y1 * math.sin(theta)
-        return rho, theta
-
-    def get_inliers(self, line, points):
-        rho, theta = line
-        inliers = []
-        for i, (x, y) in enumerate(points):
-            distance = abs(x * math.cos(theta) + y * math.sin(theta) - rho)
-            if distance < self.threshold:
-                inliers.append(i)
-        return inliers
-
+from hough_line_detector import HoughLineDetector
+from ransac_line_detector import RansacLineDetector
+from preprocessing import ScanPreprocesor
 
 # Основной класс обработки данных лидара
 class LidarProcessor:
     def __init__(self, map_corners, method="ransac"):
         self.map_corners = map_corners
+        self.preprocessor = ScanPreprocesor()
         # Выбор метода детекции линий
         if method == "hough":
             self.line_detector = HoughLineDetector()
@@ -159,7 +65,7 @@ class LidarProcessor:
         if len(points) == 0:
             return
 
-        points = self.preprocess_points(points, distance_threshold=0.5)
+        points = self.preprocessor.preprocess_points(points, distance_threshold=0.5)
 
         # Публикация калибровочного скана в GT системе координат
         calibration_marker = Marker()
@@ -213,70 +119,6 @@ class LidarProcessor:
                 except np.linalg.LinAlgError:
                     pass
         return corners[:4]
-
-    def compute_convex_hull(self, points):
-        """Вычисляет выпуклую оболочку точек с использованием алгоритма Грэхема."""
-        if len(points) < 3:
-            return points  # Если точек меньше 3, оболочка не строится
-
-        # Находим точку с минимальной y-координатой (при равенстве — минимальной x)
-        start_idx = np.argmin(points[:, 1])
-        start_point = points[start_idx]
-        hull_points = [start_point]
-        points = np.delete(points, start_idx, axis=0)
-
-        # Вычисляем полярные углы относительно начальной точки
-        vectors = points - start_point
-        angles = np.arctan2(vectors[:, 1], vectors[:, 0])
-        sorted_indices = np.argsort(angles)
-        sorted_points = points[sorted_indices]
-
-        # Строим выпуклую оболочку
-        for point in sorted_points:
-            while (len(hull_points) >= 2 and
-                   np.cross(hull_points[-1] - hull_points[-2], point - hull_points[-2]) <= 0):
-                hull_points.pop()
-            hull_points.append(point)
-
-        return np.array(hull_points)
-
-    def point_to_line_distance(self, point, line_start, line_end):
-        """Вычисляет расстояние от точки до отрезка."""
-        p = np.array(point)
-        a = np.array(line_start)
-        b = np.array(line_end)
-        ab = b - a
-        ap = p - a
-        bp = p - b
-
-        # Если проекция точки лежит вне отрезка
-        if np.dot(ab, ap) < 0:
-            return np.hypot(ap[0], ap[1])  # Расстояние до a
-        elif np.dot(-ab, bp) < 0:
-            return np.hypot(bp[0], bp[1])  # Расстояние до b
-        # Если проекция внутри отрезка
-        else:
-            return abs(np.cross(ab, ap)) / np.hypot(ab[0], ab[1])  # Перпендикулярное расстояние
-
-    def preprocess_points(self, points, distance_threshold=0.5):
-        """Фильтрует точки, оставляя те, что находятся не дальше distance_threshold от выпуклой оболочки."""
-        # Вычисляем выпуклую壳очку
-        hull_points = self.compute_convex_hull(points)
-        if len(hull_points) < 3:
-            return points  # Если оболочка не построена, возвращаем исходные точки
-
-        # Фильтруем точки
-        filtered_points = []
-        for point in points:
-            # Находим минимальное расстояние до всех рёбер оболочки
-            min_distance = min(
-                self.point_to_line_distance(point, hull_points[i], hull_points[(i + 1) % len(hull_points)])
-                for i in range(len(hull_points))
-            )
-            if min_distance <= distance_threshold:
-                filtered_points.append(point)
-
-        return np.array(filtered_points)
 
     def force_match_corners(self, detected_corners, map_corners):
         """Принудительно сопоставляет обнаруженные углы с GT углами"""
@@ -355,6 +197,6 @@ if __name__ == "__main__":
     rospy.init_node("lidar_processor")
     # 14/7
     map_corners = [(0, 0), (7, 0), (7, 14), (0, 14)]  # Пример: комната 14x7 метра
-    method = "ransac"  # или "ransac"
+    method = "hough"  # или "ransac"
     processor = LidarProcessor(map_corners, method=method)
     rospy.spin()
