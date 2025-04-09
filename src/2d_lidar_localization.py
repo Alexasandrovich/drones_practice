@@ -12,6 +12,7 @@ from preprocessing import ScanPreprocesor
 class LidarProcessor:
     def __init__(self, map_corners, method="ransac"):
         self.map_corners = map_corners
+        self.current_pose = [0, 0, 0]  # x, y, yaw
         self.preprocessor = ScanPreprocesor()
         # Выбор метода детекции линий
         if method == "hough":
@@ -63,6 +64,10 @@ class LidarProcessor:
 
         # Публикация калибровочного скана в GT системе координат
         self.publish_markers(points, lines, detected_corners, robot_pose, msg.header)
+
+    def get_current_pose(self):
+        return self.current_pose
+
 
     def publish_gt_map(self, robot_pose):
         """Публикует статичную GT карту в топике /gt_map с центром в (0, 0)"""
@@ -190,7 +195,9 @@ class LidarProcessor:
     def match_corners(self, detected_corners):
         x, y, yaw = 0, 0, 0
         # todo: используйте self.map_corners для нахождения соответствия между углами карты и найденными углами
-        return [x, y, yaw]
+
+        self.current_pose = [x, y, yaw]
+        return self.current_pose
 
 
 if __name__ == "__main__":
