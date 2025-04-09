@@ -4,7 +4,6 @@ import numpy as np
 from sensor_msgs.msg import LaserScan
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
-from std_msgs.msg import Header
 from hough_line_detector import HoughLineDetector
 from ransac_line_detector import RansacLineDetector
 from preprocessing import ScanPreprocesor
@@ -33,27 +32,6 @@ class LidarProcessor:
         self.center_x = sum(c[0] for c in map_corners) / 4
         self.center_y = sum(c[1] for c in map_corners) / 4
         self.shifted_map_corners = [(x - self.center_x, y - self.center_y) for x, y in map_corners]
-        self.publish_gt_map()
-
-    def publish_gt_map(self):
-        """Публикует статичную GT карту в топике /gt_map с центром в (0, 0)"""
-        ma = MarkerArray()
-        gt_marker = Marker()
-        gt_marker.header.frame_id = "map"
-        gt_marker.header.stamp = rospy.Time.now()
-        gt_marker.id = 0
-        gt_marker.type = Marker.LINE_LIST
-        gt_marker.scale.x = 0.05
-        gt_marker.color.g = 1.0
-        gt_marker.color.a = 1.0
-        for i in range(4):
-            p1 = Point(self.shifted_map_corners[i][0], self.shifted_map_corners[i][1], 0)
-            p2 = Point(self.shifted_map_corners[(i + 1) % 4][0], self.shifted_map_corners[(i + 1) % 4][1], 0)
-            gt_marker.points.append(p1)
-            gt_marker.points.append(p2)
-        ma.markers.append(gt_marker)
-        self.gt_map_pub.publish(ma)
-
 
     def scan_callback(self, msg):
         """Обработка данных лидара"""
@@ -81,13 +59,54 @@ class LidarProcessor:
             return
 
         # "Натягивание" углов на GT карту
-        matched_corners = self.force_match_corners(detected_corners, self.map_corners)
-
-        # Определение положения робота
-        robot_position = self.calculate_robot_position(matched_corners)
+        robot_pose = self.match_corners(detected_corners)
 
         # Публикация калибровочного скана в GT системе координат
-        self.publish_markers(points, lines, detected_corners, msg.header)
+        self.publish_markers(points, lines, detected_corners, robot_pose, msg.header)
+
+    def publish_gt_map(self, robot_pose):
+        """Публикует статичную GT карту в топике /gt_map с центром в (0, 0)"""
+        ma = MarkerArray()
+        gt_marker = Marker()
+        gt_marker.header.frame_id = "map"
+        gt_marker.header.stamp = rospy.Time.now()
+        gt_marker.id = 0
+        gt_marker.type = Marker.LINE_LIST
+        gt_marker.scale.x = 0.05
+        gt_marker.color.g = 1.0
+        gt_marker.color.a = 1.0
+        for i in range(4):
+            p1 = Point(self.shifted_map_corners[i][0], self.shifted_map_corners[i][1], 0)
+            p2 = Point(self.shifted_map_corners[(i + 1) % 4][0], self.shifted_map_corners[(i + 1) % 4][1], 0)
+            gt_marker.points.append(p1)
+            gt_marker.points.append(p2)
+        ma.markers.append(gt_marker)
+
+        # Публикация ориентации дрона в виде стрелки
+        rospy.logwarn(f"robot pose = {robot_pose}")
+        x, y, yaw = robot_pose
+        arrow_marker = Marker()
+        arrow_marker.header.frame_id = "map"
+        arrow_marker.ns = "robot_arrow"
+        arrow_marker.id = 3
+        arrow_marker.type = Marker.ARROW
+        arrow_marker.action = Marker.ADD
+        arrow_marker.scale.x = 0.1  # длина стрелки
+        arrow_marker.scale.y = 0.1  # толщина хвоста
+        arrow_marker.scale.z = 0.1  # толщина головы
+        arrow_marker.color.r = 0.0
+        arrow_marker.color.g = 1.0
+        arrow_marker.color.b = 0.0
+        arrow_marker.color.a = 1.0
+
+        start_point = Point(x, y, 0)
+        end_point = Point(x + math.cos(yaw) * 0.5, y + math.sin(yaw) * 0.5, 0)  # вектор ориентации
+
+        arrow_marker.points.append(start_point)
+        arrow_marker.points.append(end_point)
+
+        ma.markers.append(arrow_marker)
+        self.gt_map_pub.publish(ma)
 
     def rho_theta_to_points(self, rho, theta, length=10):
         """Преобразует параметры прямой в две точки для отрисовки"""
@@ -99,7 +118,7 @@ class LidarProcessor:
         p2 = (x0 - dx, y0 - dy)
         return p1, p2
 
-    def publish_markers(self, points, lines, detected_corners, header):
+    def publish_markers(self, points, lines, detected_corners, robot_pose, header):
         marker_array = MarkerArray()
 
         # Публикация исходного скана
@@ -149,6 +168,7 @@ class LidarProcessor:
 
         # Публикация всего массива
         self.marker_pub.publish(marker_array)
+        self.publish_gt_map(robot_pose)
 
     def find_corners(self, lines):
         """Находит углы как пересечения линий"""
@@ -167,43 +187,10 @@ class LidarProcessor:
                     pass
         return corners[:4]
 
-    def force_match_corners(self, detected_corners, map_corners):
-        """Принудительно сопоставляет обнаруженные углы с GT углами"""
-        if len(detected_corners) < 4:
-            detected_corners += [detected_corners[-1]] * (4 - len(detected_corners))
-        detected_corners = detected_corners[:4]
-        matched = []
-        used_map_indices = []
-        for dc in detected_corners:
-            distances = [
-                math.hypot(dc[0] - mc[0], dc[1] - mc[1])
-                for i, mc in enumerate(map_corners) if i not in used_map_indices
-            ]
-            if distances:
-                min_idx = np.argmin(distances)
-                map_idx = [i for i in range(4) if i not in used_map_indices][min_idx]
-                matched.append(map_corners[map_idx])
-                used_map_indices.append(map_idx)
-
-        return matched
-
-    def calculate_robot_position(self, corners):
-        """Вычисляет положение робота и ограничивает его границами GT карты"""
-        x_sum = sum(c[0] for c in corners)
-        y_sum = sum(c[1] for c in corners)
-        robot_x = x_sum / len(corners)
-        robot_y = y_sum / len(corners)
-
-        min_x = min(c[0] for c in self.map_corners)
-        max_x = max(c[0] for c in self.map_corners)
-        min_y = min(c[1] for c in self.map_corners)
-        max_y = max(c[1] for c in self.map_corners)
-
-        robot_x = max(min(robot_x, max_x), min_x)
-        robot_y = max(min(robot_y, max_y), min_y)
-        robot_z = 0
-        rospy.logwarn(f"robot_x, robot_y = {robot_x, robot_y}")
-        return robot_x, robot_y, robot_z
+    def match_corners(self, detected_corners):
+        x, y, yaw = 0, 0, 0
+        # todo: используйте self.map_corners для нахождения соответствия между углами карты и найденными углами
+        return [x, y, yaw]
 
 
 if __name__ == "__main__":
